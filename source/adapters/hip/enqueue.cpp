@@ -93,26 +93,26 @@ ur_result_t setHipMemAdvise(const void *DevPtr, const size_t Size,
   constexpr size_t DeviceFlagCount = 6;
 #endif
   static constexpr std::array<ur_to_hip_advice_t, DeviceFlagCount>
-      URToHIPMemAdviseDeviceFlags {
-    std::make_pair(UR_USM_ADVICE_FLAG_SET_READ_MOSTLY,
-                   hipMemAdviseSetReadMostly),
-        std::make_pair(UR_USM_ADVICE_FLAG_CLEAR_READ_MOSTLY,
-                       hipMemAdviseUnsetReadMostly),
-        std::make_pair(UR_USM_ADVICE_FLAG_SET_PREFERRED_LOCATION,
-                       hipMemAdviseSetPreferredLocation),
-        std::make_pair(UR_USM_ADVICE_FLAG_CLEAR_PREFERRED_LOCATION,
-                       hipMemAdviseUnsetPreferredLocation),
-        std::make_pair(UR_USM_ADVICE_FLAG_SET_ACCESSED_BY_DEVICE,
-                       hipMemAdviseSetAccessedBy),
-        std::make_pair(UR_USM_ADVICE_FLAG_CLEAR_ACCESSED_BY_DEVICE,
-                       hipMemAdviseUnsetAccessedBy),
+      URToHIPMemAdviseDeviceFlags{
+          std::make_pair(UR_USM_ADVICE_FLAG_SET_READ_MOSTLY,
+                         hipMemAdviseSetReadMostly),
+          std::make_pair(UR_USM_ADVICE_FLAG_CLEAR_READ_MOSTLY,
+                         hipMemAdviseUnsetReadMostly),
+          std::make_pair(UR_USM_ADVICE_FLAG_SET_PREFERRED_LOCATION,
+                         hipMemAdviseSetPreferredLocation),
+          std::make_pair(UR_USM_ADVICE_FLAG_CLEAR_PREFERRED_LOCATION,
+                         hipMemAdviseUnsetPreferredLocation),
+          std::make_pair(UR_USM_ADVICE_FLAG_SET_ACCESSED_BY_DEVICE,
+                         hipMemAdviseSetAccessedBy),
+          std::make_pair(UR_USM_ADVICE_FLAG_CLEAR_ACCESSED_BY_DEVICE,
+                         hipMemAdviseUnsetAccessedBy),
 #if defined(__HIP_PLATFORM_AMD__)
-        std::make_pair(UR_USM_ADVICE_FLAG_SET_NON_COHERENT_MEMORY,
-                       hipMemAdviseSetCoarseGrain),
-        std::make_pair(UR_USM_ADVICE_FLAG_CLEAR_NON_COHERENT_MEMORY,
-                       hipMemAdviseUnsetCoarseGrain),
+          std::make_pair(UR_USM_ADVICE_FLAG_SET_NON_COHERENT_MEMORY,
+                         hipMemAdviseSetCoarseGrain),
+          std::make_pair(UR_USM_ADVICE_FLAG_CLEAR_NON_COHERENT_MEMORY,
+                         hipMemAdviseUnsetCoarseGrain),
 #endif
-  };
+      };
   for (const auto &[URAdvice, HIPAdvice] : URToHIPMemAdviseDeviceFlags) {
     if (URAdviceFlags & URAdvice) {
       UR_CHECK_ERROR(hipMemAdvise(DevPtr, Size, HIPAdvice, Device));
@@ -770,29 +770,68 @@ UR_APIEXPORT ur_result_t UR_APICALL urEnqueueMemBufferCopyRect(
 ur_result_t commonMemSetLargePattern(hipStream_t Stream, uint32_t PatternSize,
                                      size_t Size, const void *pPattern,
                                      hipDeviceptr_t Ptr) {
-  // Calculate the number of patterns, stride, number of times the pattern
-  // needs to be applied, and the number of times the first 32 bit pattern
-  // needs to be applied.
-  auto NumberOfSteps = PatternSize / sizeof(uint8_t);
-  auto Pitch = NumberOfSteps * sizeof(uint8_t);
-  auto Height = Size / NumberOfSteps;
-  auto Count32 = Size / sizeof(uint32_t);
 
   // Get 4-byte chunk of the pattern and call hipMemsetD32Async
+  auto Count32 = Size / sizeof(uint32_t);
   auto Value = *(static_cast<const uint32_t *>(pPattern));
   UR_CHECK_ERROR(hipMemsetD32Async(Ptr, Value, Count32, Stream));
-  for (auto step = 4u; step < NumberOfSteps; ++step) {
-    // take 1 byte of the pattern
-    Value = *(static_cast<const uint8_t *>(pPattern) + step);
 
-    // offset the pointer to the part of the buffer we want to write to
-    auto OffsetPtr = reinterpret_cast<void *>(reinterpret_cast<uint8_t *>(Ptr) +
-                                              (step * sizeof(uint8_t)));
+  auto memsetRemainPattern = [&Stream, &pPattern,
+                              &Ptr](const auto Size, const auto PatternSize) {
+    // Calculate the number of patterns, stride and the number of times the
+    // pattern needs to be applied.
+    auto NumberOfSteps = PatternSize / sizeof(uint8_t);
+    auto Pitch = NumberOfSteps * sizeof(uint8_t);
+    auto Height = Size / NumberOfSteps;
 
-    // set all of the pattern chunks
-    UR_CHECK_ERROR(hipMemset2DAsync(OffsetPtr, Pitch, Value, sizeof(uint8_t),
-                                    Height, Stream));
-  }
+    for (auto step = 4u; step < NumberOfSteps; ++step) {
+      // take 1 byte of the pattern
+      auto Value = *(static_cast<const uint8_t *>(pPattern) + step);
+
+      // offset the pointer to the part of the buffer we want to write to
+      auto OffsetPtr = reinterpret_cast<void *>(
+          reinterpret_cast<uint8_t *>(Ptr) + (step * sizeof(uint8_t)));
+
+      // set all of the pattern chunks
+      UR_CHECK_ERROR(hipMemset2DAsync(OffsetPtr, Pitch, Value, sizeof(uint8_t),
+                                      Height, Stream));
+    }
+  };
+  // There is a bug in ROCm prior to 6.0.0 version which causes hipMemset2D and
+  // hipMemset3D to behave incorrectly when acting on host pinned memory. In
+  // such a case the following part of memsetting the remaining part of the
+  // pattern is emulated with memcpy.
+#if HIP_VERSION < 60000000
+  hipPointerAttribute_t ptrAttribs{};
+  UR_CHECK_ERROR(hipPointerGetAttributes(&ptrAttribs, (const void *)Ptr));
+
+  const bool ptrIsHost{ptrAttribs.memoryType == hipMemoryTypeHost};
+
+  // The memoryType member of ptrAttrbis is set to hipMemoryTypeHost for both
+  // hipHostMalloc and (incorrectly) for hipMallocManaged. So to make sure that
+  // the Ptr is corresponding to host pinned memory we need to additionally use
+  // a boolean member of ptrAttribs: isManaged.
+  if (ptrIsHost && !ptrAttribs.isManaged) {
+    const auto NumOfCopySteps = Size / PatternSize;
+    const auto Offset = sizeof(uint32_t);
+    const auto LeftPatternSize = PatternSize - Offset;
+    const auto OffsetPatternPtr = reinterpret_cast<const void *>(
+        reinterpret_cast<const uint8_t *>(pPattern) + Offset);
+
+    // Loop through the memory area to memset, advancing each time by the
+    // PatternSize and memcpy the left over pattern bits.
+    for (uint32_t i = 0; i < NumOfCopySteps; ++i) {
+      auto OffsetDstPtr = reinterpret_cast<void *>(
+          reinterpret_cast<uint8_t *>(Ptr) + Offset + i * PatternSize);
+      UR_CHECK_ERROR(hipMemcpyAsync(OffsetDstPtr, OffsetPatternPtr,
+                                    LeftPatternSize, hipMemcpyHostToHost,
+                                    Stream));
+    }
+  } else
+    memsetRemainPattern(Size, PatternSize);
+#else
+  memsetRemainPattern(Size, PatternSize);
+#endif
   return UR_RESULT_SUCCESS;
 }
 
