@@ -769,6 +769,28 @@ UR_APIEXPORT ur_result_t UR_APICALL urEnqueueMemBufferCopyRect(
   return Result;
 }
 
+static inline void memsetRemainPattern(hipStream_t Stream, uint32_t PatternSize,
+                                       size_t Size, const void *pPattern,
+                                       hipDeviceptr_t Ptr) {
+
+  // Calculate the number of patterns, stride and the number of times the
+  // pattern needs to be applied.
+  auto NumberOfSteps = PatternSize / sizeof(uint8_t);
+  auto Pitch = NumberOfSteps * sizeof(uint8_t);
+  auto Height = Size / NumberOfSteps;
+  for (auto step = 4u; step < NumberOfSteps; ++step) {
+    // take 1 byte of the pattern
+    auto Value = *(static_cast<const uint8_t *>(pPattern) + step);
+
+    // offset the pointer to the part of the buffer we want to write to
+    auto OffsetPtr = reinterpret_cast<void *>(reinterpret_cast<uint8_t *>(Ptr) +
+                                              (step * sizeof(uint8_t)));
+    // set all of the pattern chunks
+    UR_CHECK_ERROR(hipMemset2DAsync(OffsetPtr, Pitch, Value, sizeof(uint8_t),
+                                    Height, Stream));
+  }
+}
+
 // HIP has no memset functions that allow setting values more than 4 bytes. UR
 // API lets you pass an arbitrary "pattern" to the buffer fill, which can be
 // more than 4 bytes. We must break up the pattern into 1 byte values, and set
@@ -778,29 +800,44 @@ UR_APIEXPORT ur_result_t UR_APICALL urEnqueueMemBufferCopyRect(
 ur_result_t commonMemSetLargePattern(hipStream_t Stream, uint32_t PatternSize,
                                      size_t Size, const void *pPattern,
                                      hipDeviceptr_t Ptr) {
-  // Calculate the number of patterns, stride, number of times the pattern
-  // needs to be applied, and the number of times the first 32 bit pattern
-  // needs to be applied.
-  auto NumberOfSteps = PatternSize / sizeof(uint8_t);
-  auto Pitch = NumberOfSteps * sizeof(uint8_t);
-  auto Height = Size / NumberOfSteps;
-  auto Count32 = Size / sizeof(uint32_t);
 
   // Get 4-byte chunk of the pattern and call hipMemsetD32Async
+  auto Count32 = Size / sizeof(uint32_t);
   auto Value = *(static_cast<const uint32_t *>(pPattern));
   UR_CHECK_ERROR(hipMemsetD32Async(Ptr, Value, Count32, Stream));
-  for (auto step = 4u; step < NumberOfSteps; ++step) {
-    // take 1 byte of the pattern
-    Value = *(static_cast<const uint8_t *>(pPattern) + step);
 
-    // offset the pointer to the part of the buffer we want to write to
-    auto OffsetPtr = reinterpret_cast<void *>(reinterpret_cast<uint8_t *>(Ptr) +
-                                              (step * sizeof(uint8_t)));
+  // There is a bug in ROCm prior to 6.0.0 version which causes hipMemset2D
+  // to behave incorrectly when acting on host pinned memory.
+  // In such a case, the memset operation is partially emulated with memcpy.
+#if HIP_VERSION_MAJOR < 6
+  hipPointerAttribute_t ptrAttribs{};
+  UR_CHECK_ERROR(hipPointerGetAttributes(&ptrAttribs, (const void *)Ptr));
 
-    // set all of the pattern chunks
-    UR_CHECK_ERROR(hipMemset2DAsync(OffsetPtr, Pitch, Value, sizeof(uint8_t),
-                                    Height, Stream));
+  // The hostPointer attribute is non-null also for shared memory allocations.
+  // To make sure that this workaround only executes for host pinned memory, we
+  // need to check that isManaged attribute is false.
+  if (ptrAttribs.hostPointer && !ptrAttribs.isManaged) {
+    const auto NumOfCopySteps = Size / PatternSize;
+    const auto Offset = sizeof(uint32_t);
+    const auto LeftPatternSize = PatternSize - Offset;
+    const auto OffsetPatternPtr = reinterpret_cast<const void *>(
+        reinterpret_cast<const uint8_t *>(pPattern) + Offset);
+
+    // Loop through the memory area to memset, advancing each time by the
+    // PatternSize and memcpy the left over pattern bits.
+    for (uint32_t i = 0; i < NumOfCopySteps; ++i) {
+      auto OffsetDstPtr = reinterpret_cast<void *>(
+          reinterpret_cast<uint8_t *>(Ptr) + Offset + i * PatternSize);
+      UR_CHECK_ERROR(hipMemcpyAsync(OffsetDstPtr, OffsetPatternPtr,
+                                    LeftPatternSize, hipMemcpyHostToHost,
+                                    Stream));
+    }
+  } else {
+    memsetRemainPattern(Stream, PatternSize, Size, pPattern, Ptr);
   }
+#else
+  memsetRemainPattern(Stream, PatternSize, Size, pPattern, Ptr);
+#endif
   return UR_RESULT_SUCCESS;
 }
 
