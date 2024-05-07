@@ -245,7 +245,6 @@ static ur_result_t enqueueMemFillHelper(ur_command_t CommandType,
   // PatternSize must be a power of two for zeCommandListAppendMemoryFill.
   // When it's not, the fill is emulated with zeCommandListAppendMemoryCopy.
   if (isPowerOf2(PatternSize)) {
-    UR_ASSERT(false, UR_RESULT_ERROR_OUT_OF_HOST_MEMORY);
     ZE2UR_CALL(zeCommandListAppendMemoryFill,
                (ZeCommandList, Ptr, Pattern, PatternSize, Size, ZeEvent,
                 WaitList.Length, WaitList.ZeEventList));
@@ -257,7 +256,7 @@ static ur_result_t enqueueMemFillHelper(ur_command_t CommandType,
 
     // Execute command list asynchronously, as the event will be used
     // to track down its completion.
-    UR_CALL(Queue->executeCommandList(CommandList, false, OkToBatch));
+    UR_CALL(Queue->executeCommandList(CommandList, true, OkToBatch));
   } else {
     // Copy pattern into every entry in memory array pointed by Ptr.
     uint32_t NumOfCopySteps = Size / PatternSize;
