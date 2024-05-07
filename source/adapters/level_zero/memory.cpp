@@ -189,6 +189,7 @@ static ur_result_t enqueueMemFillHelper(ur_command_t CommandType,
                                         uint32_t NumEventsInWaitList,
                                         const ur_event_handle_t *EventWaitList,
                                         ur_event_handle_t *OutEvent) {
+  assert(false && "beginning of enqueueMemFillHelper");
   auto &Device = Queue->Device;
 
   // Make sure that pattern size matches the capability of the copy queues.
@@ -244,8 +245,9 @@ static ur_result_t enqueueMemFillHelper(ur_command_t CommandType,
 
   // PatternSize must be a power of two for zeCommandListAppendMemoryFill.
   // When it's not, the fill is emulated with zeCommandListAppendMemoryCopy.
+  assert(false && "before isPowerOf2");
   if (isPowerOf2(PatternSize)) {
-    assert(false && "Got as far as here!");
+    assert(false && "After isPowerOf2");
     ZE2UR_CALL(zeCommandListAppendMemoryFill,
                (ZeCommandList, Ptr, Pattern, PatternSize, Size, ZeEvent,
                 WaitList.Length, WaitList.ZeEventList));
